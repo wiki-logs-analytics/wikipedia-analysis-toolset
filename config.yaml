@@ -1,0 +1,6 @@
+elasticsearch:
+  enable: true
+  host: http://localhost:9200
+  login: 
+  pwd: 
+  index: wiki_logs
