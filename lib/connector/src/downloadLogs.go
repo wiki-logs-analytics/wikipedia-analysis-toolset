@@ -204,12 +204,12 @@ func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, cu
 
 		docID++
 
-		idStr := strconv.Itoa(docID)
+		//	idStr := strconv.Itoa(docID)
 
 		req := elastic.NewBulkIndexRequest()
 		req.OpType("index")
 		req.Index(config.Elasticsearch.Index)
-		req.Id(idStr)
+		//		req.Id(idStr)
 		req.Doc(doc)
 
 		bulk.Add(req)
