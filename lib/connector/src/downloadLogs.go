@@ -2,23 +2,24 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/olivere/elastic/v7"
+	"github.com/valyala/fasthttp"
 	"gopkg.in/yaml.v2"
 )
 
@@ -42,7 +43,7 @@ type WikiLog struct {
 }
 
 type LogPacket struct {
-	rsp   *http.Response
+	rsp   *fasthttp.Response
 	year  string
 	month string
 	day   string
@@ -80,32 +81,36 @@ func removeDuplicatesUnordered(elements []string) []string {
 	return result
 }
 
-func downloadLog(path string, client *http.Client, c chan *LogPacket, year string, month string, day string, hours string) {
+func downloadLog(path string, client *fasthttp.Client, c chan *LogPacket, year string, month string, day string, hours string) {
 
 	log.Printf("Downloading %s", path)
 
-	req, err := http.NewRequest(http.MethodGet, path, nil)
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	req.SetRequestURI(path)
+
+	rsp := fasthttp.AcquireResponse()
+
+	err := client.Do(req, rsp)
 	assert(err)
 
-	rsp, err := client.Do(req)
-	assert(err)
-
-	attempts := 50
+	attempts := 1000
 	for true {
-		if rsp.StatusCode != http.StatusOK {
-			log.Print(errors.New("Failed to GET gz file " + path + " status " + rsp.Status))
-			time.Sleep(time.Second * 60)
+		if rsp.StatusCode() != fasthttp.StatusOK {
+			log.Print(errors.New("Failed to GET gz file " + path + " status " + string(rsp.StatusCode())))
+			time.Sleep(time.Second * 5)
 			attempts = attempts - 1
 		} else {
 			log.Print("Succsess, attempts left ", attempts)
 			break
 		}
 
-		rsp, err = client.Do(req)
+		err := client.Do(req, rsp)
 		assert(err)
 	}
 
-	log.Print("Result : ", rsp.StatusCode)
+	log.Print("Result : ", rsp.StatusCode())
 
 	c <- &LogPacket{rsp: rsp, year: year, month: month, day: day, hours: hours}
 }
@@ -113,53 +118,57 @@ func downloadLog(path string, client *http.Client, c chan *LogPacket, year strin
 func downloadLogs(year string, month string, outputPath string, c chan *LogPacket, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	defaultRoundTripper := http.DefaultTransport
-	defaultTransportPtr, ok := defaultRoundTripper.(*http.Transport)
-	if !ok {
-		panic(fmt.Sprintf("defaultRoundTripper not an *http.Transport"))
+	client := fasthttp.Client{
+		MaxConnsPerHost: 4,
 	}
-	defaultTransport := *defaultTransportPtr
-	defaultTransport.MaxIdleConns = 100
-	defaultTransport.MaxIdleConnsPerHost = 100
 
-	client := &http.Client{Transport: &defaultTransport}
+	req := fasthttp.AcquireRequest()
+	rsp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(rsp)
 
 	url := fmt.Sprintf("https://dumps.wikimedia.org/other/pageviews/%s/%s-%s/", year, year, month)
 
+	req.SetRequestURI(url)
+
 	log.Printf("download logs from %s to %s\n", url, outputPath)
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	assert(err)
+	client.Do(req, rsp)
 
-	rsp, err := client.Do(req)
-	assert(err)
-
-	data, err := ioutil.ReadAll(rsp.Body)
-	assert(err)
+	data := rsp.Body()
 
 	reg, err := regexp.Compile("pageviews-\\d{8}-\\d{6}\\.gz")
 	assert(err)
 
-	for _, logGz := range removeDuplicatesUnordered(reg.FindAllString(string(data), -1)) {
-		day := logGz[16:17]
-		hours := logGz[19:20]
-		downloadLog(url+logGz, client, c, year, month, day, hours)
+	packegs := removeDuplicatesUnordered(reg.FindAllString(string(data), -1))
+	sort.Strings(packegs)
+	for _, logGz := range packegs {
+		day := logGz[16:18]
+		hours := logGz[19:21]
+		downloadLog(url+logGz, &client, c, year, month, day, hours)
 	}
 
 	c <- nil
 }
 
-func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup) {
+func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, currentWorkers *uint64) {
 
 	defer wg.Done()
+	defer func() { *currentWorkers-- }()
+	defer fasthttp.ReleaseResponse(logs.rsp)
+
 	ctx := context.Background()
 	log.Print("Decompressing")
-	reader, err := gzip.NewReader(logs.rsp.Body)
+	rawReader := bytes.NewReader(logs.rsp.Body())
+	reader, err := gzip.NewReader(rawReader)
 	assert(err)
 	defer reader.Close()
 
+	bulk := es.Bulk()
+	docID := 0
+
 	bufReader := bufio.NewReader(reader)
-	i := 0
+	russianWas := false
 	for true {
 		line, _, _ := bufReader.ReadLine()
 		if len(line) <= 0 {
@@ -169,39 +178,62 @@ func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup) {
 		slice := strings.Split(string(line), " ")
 
 		if slice[0] != "ru" {
+			if russianWas {
+				break
+			}
 			continue
 		}
 
-		/*		if slice[0][0:1] == "ar" {
+		russianWas = true
+
+		/*
+			jsonLogStr := fmt.Sprintf("{\"Date\":\"%s-%s-%sT%s:00:00Z\",\"Page\":\"%s\",\"Visits\":%s,\"Region\":\"%s\"}",
+				logs.year, logs.month, logs.day, logs.hours, slice[1], slice[2], slice[0])
+
+			if slice[0][0:1] == "ar" {
 				log = WikiLog{Page = slice[3], NumberOfVisits = slice[2], UknowValue = slice[1], Region = slice[0]}
 			}*/
 
 		numberOfVisits, _ := strconv.ParseUint(slice[2], 10, 16)
 		timestamp := fmt.Sprintf("%s-%s-%sT%s:00:00Z", logs.year, logs.month, logs.day, logs.hours)
-		logWiki := WikiLog{Page: slice[1],
+		doc := WikiLog{Page: slice[1],
 			Visits: uint16(numberOfVisits),
 			Region: slice[0],
 			Date:   timestamp,
 		}
 
-		jsonLog, err := json.Marshal(logWiki)
-		assert(err)
+		docID++
 
-		_, err = es.Index().Index(config.Elasticsearch.Index).BodyString(string(jsonLog)).Do(ctx)
-		assert(err)
+		idStr := strconv.Itoa(docID)
 
-		i = i + 1
+		req := elastic.NewBulkIndexRequest()
+		req.OpType("index")
+		req.Index(config.Elasticsearch.Index)
+		req.Id(idStr)
+		req.Doc(doc)
+
+		bulk.Add(req)
 	}
 
-	log.Printf("Decompressed data - %d records", i)
+	_, err = bulk.Do(ctx)
+	assert(err)
+
+	log.Printf("[COMPLETED] Decompressed data - %d records", docID)
 }
 
 func unzipAndAddToESTh(c chan *LogPacket, wg *sync.WaitGroup, config *JsonConfig) {
 	defer wg.Done()
+	var currentWorkers uint64
 
-	es, err := elastic.NewClient()
+	currentWorkers = 0
+
+	es, err := elastic.NewClient(
+		elastic.SetSniff(true),
+		elastic.SetURL("http://localhost:9200"),
+		elastic.SetHealthcheckInterval(5*time.Second), // quit trying after 5 seconds
+	)
 	assert(err)
-	log.Print("ES Info:")
+	log.Print("ES Info:", es)
 	for true {
 		logs := <-c
 
@@ -210,7 +242,13 @@ func unzipAndAddToESTh(c chan *LogPacket, wg *sync.WaitGroup, config *JsonConfig
 		}
 
 		wg.Add(1)
-		go unzipAndAddToES(logs, es, wg)
+		for currentWorkers > 8 {
+			time.Sleep(time.Second * 5)
+		}
+
+		currentWorkers++
+
+		go unzipAndAddToES(logs, es, wg, &currentWorkers)
 	}
 
 }
@@ -231,6 +269,10 @@ func parseConfig(configPath *string) *JsonConfig {
 
 func main() {
 	var wg sync.WaitGroup
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	log.Print("Using CPUs ", runtime.NumCPU())
 
 	configFile := flag.String("config", "../config.yaml", "a string")
 	flag.Parse()

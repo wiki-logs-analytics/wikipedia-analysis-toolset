@@ -4,12 +4,16 @@ VERSION := 0.0.1
 
 BIN_DIR     := ./bin
 
-.PHONY: build
+.PHONY: build_release
 
-build:
+build_release:
+	sudo apt-get install gccgo
+	GOOS=linux go build -a -gccgoflags "-march=native -O3" -compiler gccgo -o ${BIN_DIR}/ ./lib/connector/src/*.go
+
+build_debug:
 	GOOS=linux go build -o ${BIN_DIR}/ ./lib/connector/src/*.go
 
-run: build
+run: build_release
 	${BIN_DIR}/${NAME} ${flags}
 
 lint:
