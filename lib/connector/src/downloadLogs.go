@@ -151,13 +151,32 @@ func downloadLogs(year string, month string, outputPath string, c chan *LogPacke
 	c <- nil
 }
 
+func sendToES(bulk *elastic.BulkService, wg *sync.WaitGroup) {
+	if wg != nil {
+		defer wg.Done()
+	}
+
+	ctx := context.Background()
+
+	for true {
+		_, err := bulk.Do(ctx)
+
+		if err != nil {
+			log.Print(err)
+			log.Print("Sleep for 5 seconds and then retry...")
+			time.Sleep(time.Second * 5)
+		} else {
+			break
+		}
+	}
+}
+
 func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, currentWorkers *uint64) {
 
 	defer wg.Done()
 	defer func() { *currentWorkers-- }()
 	defer fasthttp.ReleaseResponse(logs.rsp)
 
-	ctx := context.Background()
 	log.Print("Decompressing")
 	rawReader := bytes.NewReader(logs.rsp.Body())
 	reader, err := gzip.NewReader(rawReader)
@@ -204,19 +223,24 @@ func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, cu
 
 		docID++
 
-		//	idStr := strconv.Itoa(docID)
-
 		req := elastic.NewBulkIndexRequest()
 		req.OpType("index")
 		req.Index(config.Elasticsearch.Index)
-		//		req.Id(idStr)
 		req.Doc(doc)
 
 		bulk.Add(req)
+
+		if docID%100000 == 0 {
+
+			wg.Add(1)
+			go sendToES(bulk, wg)
+
+			bulk = es.Bulk()
+		}
 	}
 
-	_, err = bulk.Do(ctx)
-	assert(err)
+	wg.Add(1)
+	go sendToES(bulk, wg)
 
 	log.Printf("[COMPLETED] Decompressed data - %d records", docID)
 }
@@ -242,7 +266,7 @@ func unzipAndAddToESTh(c chan *LogPacket, wg *sync.WaitGroup, config *JsonConfig
 		}
 
 		wg.Add(1)
-		for currentWorkers > 8 {
+		for currentWorkers > 4 {
 			time.Sleep(time.Second * 5)
 		}
 
