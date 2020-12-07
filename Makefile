@@ -24,6 +24,9 @@ test:
 coverage:
 	go tool cover -html=coverage.out -o coverage.html
 
+print_version:
+	$(info $(VERSION))
+
 clean:
 	go clean
 	rm -f ${BIN_DIR}/${NAME}
