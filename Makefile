@@ -7,7 +7,6 @@ BIN_DIR     := ./bin
 .PHONY: build_release
 
 build_release:
-	sudo apt-get install gccgo
 	GOOS=linux go build -a -gccgoflags "-march=native -O3" -compiler gccgo -o ${BIN_DIR}/ ./lib/connector/src/*.go
 
 build_debug:
