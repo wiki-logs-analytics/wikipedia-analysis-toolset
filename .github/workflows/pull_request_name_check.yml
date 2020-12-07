@@ -1,4 +1,4 @@
-name: 'Jira Check'
+name: 'Pull Request Contains Jira Task Check'
 on:
   pull_request:
     types:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-18.04
     steps:
       - uses: actions/checkout@v1
-      - uses: dylanvann/check-pull-request-title@v1
+      - uses: dylanvann/check-pull-request-title@v0.1.14
         with:
           # Match pull request titles in the form BIG-1234 - Message.
           pattern: '^BIG-\d* - '
