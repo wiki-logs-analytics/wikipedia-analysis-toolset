@@ -1,19 +1,20 @@
 name: 'Pull Request Contains Jira Task Check'
+
 on:
   pull_request:
-    types:
-      # Check title when opened.
-      - opened
-      # Check title when new commits are pushed.
-      # Required to use as a status check.
-      - synchronize
+    # Possible values: https://help.github.com/en/actions/reference/events-that-trigger-workflows#pull-request-event-pull_request
+    types: [opened, edited, reopened]
 
 jobs:
-  publish:
-    runs-on: ubuntu-18.04
+  pr-lint:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v1
-      - uses: dylanvann/check-pull-request-title@v0.1.14
+      - uses: morrisoncole/pr-lint-action@v1.5.0
         with:
-          # Match pull request titles in the form BIG-1234 - Message.
-          pattern: '^BIG-\d* - '
+          title-regex: "(\\[BIG-[0-9]+\\]).+"
+          on-failed-regex-fail-action: true
+          on-failed-regex-request-changes: true
+          on-failed-regex-create-review: true
+          on-failed-regex-comment:
+            "Failed regex: `%regex%`!"
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
