@@ -1,7 +1,6 @@
 
 NAME    := connector
 VERSION := 0.0.2
-
 BIN_DIR     := ./bin
 
 .PHONY: build_release
