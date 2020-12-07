@@ -1,6 +1,6 @@
 
 NAME    := connector
-VERSION := 0.0.1
+VERSION := 0.0.2
 
 BIN_DIR     := ./bin
 
