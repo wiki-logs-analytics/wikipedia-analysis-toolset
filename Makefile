@@ -6,6 +6,7 @@ BIN_DIR     := ./bin
 
 .PHONY: build_release
 
+
 build_release:
 	GOOS=linux go build -a -gccgoflags "-march=native -O3" -compiler gccgo -o ${BIN_DIR}/ ./lib/connector/src/*.go
 
