@@ -19,7 +19,7 @@ lint:
 	golangci-lint run ./...
 
 test:
-	go test -cover ./...  -coverprofile=coverage.out
+	go test -cover ./lib/connector/src/*.go  -coverprofile=coverage.out
 
 coverage:
 	go tool cover -html=coverage.out -o coverage.html
