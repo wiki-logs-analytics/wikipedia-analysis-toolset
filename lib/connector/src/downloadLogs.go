@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -98,7 +97,7 @@ func downloadLog(path string, client *fasthttp.Client, c chan *LogPacket, year s
 	attempts := 1000
 	for true {
 		if rsp.StatusCode() != fasthttp.StatusOK {
-			log.Print(errors.New("Failed to GET gz file " + path + " status " + string(rsp.StatusCode())))
+			//log.Print(errors.New("Failed to GET gz file " + path + " status " + string(rsp.StatusCode())))
 			time.Sleep(time.Second * 5)
 			attempts = attempts - 1
 		} else {
