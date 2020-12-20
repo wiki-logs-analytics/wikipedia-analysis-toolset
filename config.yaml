@@ -3,4 +3,4 @@ elasticsearch:
   host: http://localhost:9200
   login: 
   pwd: 
-  index: log-wiki-4
+  index: hadoop-test
