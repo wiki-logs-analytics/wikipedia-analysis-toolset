@@ -1,0 +1,4 @@
+https://dumps.wikimedia.org/other/pageviews/2021/2021-12/pageviews-20211231-180000.gz
+https://dumps.wikimedia.org/other/pageviews/2021/2021-12/pageviews-20211231-210000.gz
+https://dumps.wikimedia.org/other/pageviews/2021/2021-12/pageviews-20211231-220000.gz
+https://dumps.wikimedia.org/other/pageviews/2021/2021-12/pageviews-20211231-230000.gz

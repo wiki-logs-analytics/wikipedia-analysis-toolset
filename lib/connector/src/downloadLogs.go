@@ -3,9 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -43,28 +41,14 @@ type WikiLog struct {
 }
 
 type LogPacket struct {
-	rsp   *fasthttp.Response
-	year  string
-	month string
-	day   string
-	hours string
+	req *fasthttp.Request
+	rsp *fasthttp.Response
 }
 
 func assert(err error) {
 	if err != nil {
 		log.Panic(err)
 	}
-}
-
-func saveData(data []byte, outPath string) {
-	file, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE, os.ModePerm)
-	assert(err)
-	defer file.Close()
-
-	_, errWrite := file.Write(data)
-	assert(errWrite)
-
-	log.Printf("Saved data to %s", outPath)
 }
 
 func removeDuplicatesUnordered(elements []string) []string {
@@ -81,45 +65,13 @@ func removeDuplicatesUnordered(elements []string) []string {
 	return result
 }
 
-func downloadLog(path string, client *fasthttp.Client, c chan *LogPacket, year string, month string, day string, hours string) {
+var links []string
+var removeLink chan string
 
-	log.Printf("Downloading %s", path)
-
-	req := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(req)
-
-	req.SetRequestURI(path)
-
-	rsp := fasthttp.AcquireResponse()
-
-	err := client.Do(req, rsp)
-	assert(err)
-
-	attempts := 1000
-	for true {
-		if rsp.StatusCode() != fasthttp.StatusOK {
-			log.Print(errors.New("Failed to GET gz file " + path + " status " + string(rsp.StatusCode())))
-			time.Sleep(time.Second * 5)
-			attempts = attempts - 1
-		} else {
-			log.Print("Succsess, attempts left ", attempts)
-			break
-		}
-
-		err := client.Do(req, rsp)
-		assert(err)
-	}
-
-	log.Print("Result : ", rsp.StatusCode())
-
-	c <- &LogPacket{rsp: rsp, year: year, month: month, day: day, hours: hours}
-}
-
-func downloadLogs(year string, month string, outputPath string, c chan *LogPacket, wg *sync.WaitGroup) {
-	defer wg.Done()
+func generateLinks(from time.Time, to time.Time) {
 
 	client := fasthttp.Client{
-		MaxConnsPerHost: 4,
+		MaxConnsPerHost: 30,
 	}
 
 	req := fasthttp.AcquireRequest()
@@ -127,25 +79,126 @@ func downloadLogs(year string, month string, outputPath string, c chan *LogPacke
 	defer fasthttp.ReleaseRequest(req)
 	defer fasthttp.ReleaseResponse(rsp)
 
-	url := fmt.Sprintf("https://dumps.wikimedia.org/other/pageviews/%s/%s-%s/", year, year, month)
+	for from.Before(to) {
+		url := fmt.Sprintf("https://dumps.wikimedia.org/other/pageviews/%d/%d-%02d/", from.Year(), from.Year(), int(from.Month()))
+		req.SetRequestURI(url)
+		log.Printf("download logs from %s\n", url)
+		client.Do(req, rsp)
+		data := rsp.Body()
+		reg, err := regexp.Compile("pageviews-\\d{8}-\\d{6}\\.gz")
+		assert(err)
+		newLinks := reg.FindAllString(string(data), -1)
+		for i, newLink := range newLinks {
+			newLinks[i] = url + newLink
+		}
+		links = append(links, newLinks...)
+		from = from.Add(time.Hour * 24 * 31)
+	}
 
-	req.SetRequestURI(url)
+	links = removeDuplicatesUnordered(links)
+	sort.Strings(links)
 
-	log.Printf("download logs from %s to %s\n", url, outputPath)
+	dumpLinksListToFile()
+}
 
-	client.Do(req, rsp)
+var mutex sync.Mutex
 
-	data := rsp.Body()
+func dumpLinksListToFile() {
 
-	reg, err := regexp.Compile("pageviews-\\d{8}-\\d{6}\\.gz")
+	mutex.Lock()
+	defer mutex.Unlock()
+	os.Remove("links.txt")
+	f, err := os.OpenFile("links.txt", os.O_WRONLY|os.O_CREATE, 0666)
 	assert(err)
+	defer f.Close()
 
-	packegs := removeDuplicatesUnordered(reg.FindAllString(string(data), -1))
-	sort.Strings(packegs)
-	for _, logGz := range packegs {
-		day := logGz[16:18]
-		hours := logGz[19:21]
-		downloadLog(url+logGz, &client, c, year, month, day, hours)
+	for _, s := range links {
+		_, _ = f.WriteString(s + "\n")
+	}
+}
+
+func restoreLinksFromFile() {
+
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	links = nil
+
+	f, err := os.Open("links.txt")
+	assert(err)
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Split(bufio.ScanLines)
+
+	for scanner.Scan() {
+		links = append(links, scanner.Text())
+	}
+}
+
+func updateLinks() {
+	for true {
+		doneLink := <-removeLink
+
+		for i, link := range links {
+			if link == doneLink {
+				copy(links[i:], links[i+1:])
+				links[len(links)-1] = ""
+				links = links[:len(links)-1]
+			}
+		}
+
+		dumpLinksListToFile()
+	}
+}
+
+func downloadLog(path string, client *fasthttp.Client, c chan *LogPacket, count *int, mutex *sync.Mutex) {
+	log.Printf("Downloading %s", path)
+
+	defer func() {
+		mutex.Lock()
+		*count--
+		mutex.Unlock()
+	}()
+
+	req := fasthttp.AcquireRequest()
+
+	req.SetRequestURI(path)
+
+	rsp := fasthttp.AcquireResponse()
+
+	err := client.Do(req, rsp)
+	for rsp.StatusCode() != 200 {
+		log.Print("Failed to download ", err)
+		time.Sleep(time.Second * 5)
+		err = client.Do(req, rsp)
+	}
+
+	c <- &LogPacket{req: req, rsp: rsp}
+
+}
+
+func downloadLogs(c chan *LogPacket, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	count := 0
+	mutex := sync.Mutex{}
+
+	client := fasthttp.Client{
+		MaxConnsPerHost:     30,
+		MaxIdleConnDuration: 500000,
+	}
+
+	localLinks := make([]string, len(links))
+	copy(localLinks, links)
+	for _, link := range localLinks {
+		for count >= 3 {
+			time.Sleep(time.Second)
+		}
+		mutex.Lock()
+		count++
+		mutex.Unlock()
+		go downloadLog(link, &client, c, &count, &mutex)
 	}
 
 	c <- nil
@@ -157,38 +210,52 @@ func sendToES(bulk *elastic.BulkService, wg *sync.WaitGroup) {
 	}
 
 	ctx := context.Background()
-
-	for true {
+	cnt := 10
+	for cnt > 0 {
 		_, err := bulk.Do(ctx)
 
 		if err != nil {
 			log.Print(err)
 			log.Print("Sleep for 5 seconds and then retry...")
-			time.Sleep(time.Second * 5)
+			time.Sleep(time.Second * 6)
+			cnt--
 		} else {
 			break
 		}
 	}
+	if cnt == 0 {
+		log.Print("Failed to send data")
+	}
 }
 
-func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, currentWorkers *uint64) {
+func parseLinkToTimestamp(link string) string {
+	return fmt.Sprintf("%s-%s-%sT%s:00:00Z",
+		link[44:48], link[54:56], link[73:75], link[76:78])
+}
+
+func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, count *int, mutex *sync.Mutex) {
 
 	defer wg.Done()
-	defer func() { *currentWorkers-- }()
+
+	defer func() {
+		mutex.Lock()
+		*count--
+		mutex.Unlock()
+	}()
+
+	defer fasthttp.ReleaseRequest(logs.req)
 	defer fasthttp.ReleaseResponse(logs.rsp)
 
-	log.Print("Decompressing")
-	rawReader := bytes.NewReader(logs.rsp.Body())
-	reader, err := gzip.NewReader(rawReader)
-	assert(err)
-	defer reader.Close()
+	log.Print("Decompressing ", logs.req.URI().String())
+	body, _ := logs.rsp.BodyGunzip()
+	reader := bytes.NewReader(body)
 
 	bulk := es.Bulk()
 	docID := 0
 
 	bufReader := bufio.NewReader(reader)
 	russianWas := false
-	for true {
+	for bufReader.Size() > 0 {
 		line, _, _ := bufReader.ReadLine()
 		if len(line) <= 0 {
 			break
@@ -203,22 +270,17 @@ func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, cu
 			continue
 		}
 
+		if len(slice) < 3 {
+			continue
+		}
+
 		russianWas = true
 
-		/*
-			jsonLogStr := fmt.Sprintf("{\"Date\":\"%s-%s-%sT%s:00:00Z\",\"Page\":\"%s\",\"Visits\":%s,\"Region\":\"%s\"}",
-				logs.year, logs.month, logs.day, logs.hours, slice[1], slice[2], slice[0])
-
-			if slice[0][0:1] == "ar" {
-				log = WikiLog{Page = slice[3], NumberOfVisits = slice[2], UknowValue = slice[1], Region = slice[0]}
-			}*/
-
 		numberOfVisits, _ := strconv.ParseUint(slice[2], 10, 16)
-		timestamp := fmt.Sprintf("%s-%s-%sT%s:00:00Z", logs.year, logs.month, logs.day, logs.hours)
 		doc := WikiLog{Page: slice[1],
 			Visits: uint16(numberOfVisits),
 			Region: slice[0],
-			Date:   timestamp,
+			Date:   parseLinkToTimestamp(logs.req.URI().String()),
 		}
 
 		docID++
@@ -230,34 +292,39 @@ func unzipAndAddToES(logs *LogPacket, es *elastic.Client, wg *sync.WaitGroup, cu
 
 		bulk.Add(req)
 
-		if docID%100000 == 0 {
+		if docID%50000 == 0 {
 
 			wg.Add(1)
-			go sendToES(bulk, wg)
+			sendToES(bulk, wg)
 
 			bulk = es.Bulk()
 		}
 	}
 
 	wg.Add(1)
-	go sendToES(bulk, wg)
+	sendToES(bulk, wg)
+
+	removeLink <- logs.req.URI().String()
 
 	log.Printf("[COMPLETED] Decompressed data - %d records", docID)
 }
 
 func unzipAndAddToESTh(c chan *LogPacket, wg *sync.WaitGroup, config *JsonConfig) {
 	defer wg.Done()
-	var currentWorkers uint64
 
-	currentWorkers = 0
+	count := 0
+	mutex := sync.Mutex{}
 
 	es, err := elastic.NewClient(
 		elastic.SetSniff(true),
 		elastic.SetURL("http://localhost:9200"),
 		elastic.SetHealthcheckInterval(5*time.Second), // quit trying after 5 seconds
+		elastic.SetMaxRetries(10000),
 	)
 	assert(err)
+
 	log.Print("ES Info:", es)
+
 	for true {
 		logs := <-c
 
@@ -265,14 +332,16 @@ func unzipAndAddToESTh(c chan *LogPacket, wg *sync.WaitGroup, config *JsonConfig
 			break
 		}
 
-		wg.Add(1)
-		for currentWorkers > 4 {
-			time.Sleep(time.Second * 5)
+		for count > 4 {
+			time.Sleep(time.Second * 1)
 		}
 
-		currentWorkers++
+		mutex.Lock()
+		count++
+		mutex.Unlock()
 
-		go unzipAndAddToES(logs, es, wg, &currentWorkers)
+		wg.Add(1)
+		go unzipAndAddToES(logs, es, wg, &count, &mutex)
 	}
 
 }
@@ -299,15 +368,31 @@ func main() {
 	log.Print("Using CPUs ", runtime.NumCPU())
 
 	configFile := flag.String("config", "../config.yaml", "a string")
+	fromDate := flag.String("startDate", "", "a string")
+	toDate := flag.String("endDate", "", "a string")
+	cont := flag.Bool("continue", false, "continue download")
 	flag.Parse()
+
+	if *cont {
+		restoreLinksFromFile()
+	} else {
+		layout := "2006-01-02"
+		fromDateT, err := time.Parse(layout, *fromDate)
+		assert(err)
+		toDateT, err := time.Parse(layout, *toDate)
+		assert(err)
+		generateLinks(fromDateT, toDateT)
+	}
 
 	config = parseConfig(configFile)
 
 	os.Mkdir("../output", os.ModePerm)
 	c := make(chan *LogPacket)
+	removeLink = make(chan string)
 	wg.Add(2)
-	go downloadLogs("2020", "10", "./output/", c, &wg)
+	go downloadLogs(c, &wg)
 	go unzipAndAddToESTh(c, &wg, config)
+	go updateLinks()
 
 	wg.Wait()
 }

@@ -1,4 +1,4 @@
-module sbpstu-smart-library\connector
+module wikipedia-analysis-toolset/connector
 
 go 1.14
 
