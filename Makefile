@@ -6,6 +6,7 @@ BIN_DIR     := ./bin
 
 .PHONY: build_release
 
+
 build_release:
 	GOOS=linux go build -o ${BIN_DIR}/ ./lib/connector/src/*.go
 
